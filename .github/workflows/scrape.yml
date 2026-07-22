@@ -1,0 +1,30 @@
+name: Scrape Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Website URL to scrape'
+        required: true
+        default: 'https://example.com'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm install puppeteer
+
+      - run: node scripts/scrape.js
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scraped-site
+          path: scraped-site/
