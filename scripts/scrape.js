@@ -5,17 +5,41 @@ const crypto = require('crypto');
 const { URL } = require('url');
 const https = require('https');
 const http = require('http');
+const archiver = require('archiver');
 
 const startUrl = process.env.TARGET_URL || 'https://example.com';
 const outputDir = path.resolve('./scraped-site');
 const assetsDir = path.join(outputDir, 'assets');
 const manifest = {}; // localPath -> originalUrl
 
-function hashName(resourceUrl) {
+function hashName(resourceUrl, contentType = '') {
   try {
     const u = new URL(resourceUrl);
     let ext = path.extname(u.pathname);
-    if (!ext || ext.length > 8) ext = '';
+
+    // Check inner query param for Next.js image URLs (/_next/image?url=...)
+    if ((!ext || ext.length > 8) && u.searchParams.has('url')) {
+      const innerUrl = u.searchParams.get('url');
+      try {
+        ext = path.extname(new URL(innerUrl, resourceUrl).pathname);
+      } catch (e) {}
+    }
+
+    // Infer extension from Content-Type if ext is still missing
+    if (!ext || ext.length > 8) {
+      const ct = (contentType || '').toLowerCase();
+      if (ct.includes('image/png')) ext = '.png';
+      else if (ct.includes('image/webp')) ext = '.webp';
+      else if (ct.includes('image/jpeg') || ct.includes('image/jpg')) ext = '.jpg';
+      else if (ct.includes('image/svg')) ext = '.svg';
+      else if (ct.includes('image/gif')) ext = '.gif';
+      else if (ct.includes('text/css')) ext = '.css';
+      else if (ct.includes('javascript')) ext = '.js';
+      else if (ct.includes('font/woff2')) ext = '.woff2';
+      else if (ct.includes('font/woff')) ext = '.woff';
+      else ext = '';
+    }
+
     const hash = crypto.createHash('md5').update(resourceUrl).digest('hex').slice(0, 16);
     return `${hash}${ext}`;
   } catch (e) {
@@ -64,7 +88,6 @@ function urlToHtmlFilename(urlStr, startUrlStr) {
   return clean;
 }
 
-// Download remote asset directly via http/https (for CSS sub-resources)
 function downloadDirect(urlStr) {
   return new Promise((resolve) => {
     try {
@@ -84,6 +107,23 @@ function downloadDirect(urlStr) {
     } catch (e) {
       resolve(null);
     }
+  });
+}
+
+function createZipArchive(sourceDir, outPath) {
+  return new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(outPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    output.on('close', () => {
+      console.log(`ZIP created: ${outPath} (${archive.pointer()} total bytes)`);
+      resolve();
+    });
+
+    archive.on('error', (err) => reject(err));
+    archive.pipe(output);
+    archive.directory(sourceDir, false);
+    archive.finalize();
   });
 }
 
@@ -109,7 +149,7 @@ function downloadDirect(urlStr) {
   });
 
   const page = await browser.newPage();
-  await page.setViewport({ width: 1440, height: 900 });
+  await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
 
   page.on('response', async (response) => {
     try {
@@ -125,7 +165,8 @@ function downloadDirect(urlStr) {
       if (status >= 300 && status < 400) return;
 
       const buffer = await response.buffer();
-      const localName = hashName(normRespUrl);
+      const contentType = response.headers()['content-type'] || '';
+      const localName = hashName(normRespUrl, contentType);
       const localPath = path.join(assetsDir, localName);
       ensureDirSync(localPath);
       fs.writeFileSync(localPath, buffer);
@@ -135,7 +176,7 @@ function downloadDirect(urlStr) {
       downloaded.set(respUrl, localRelative);
       manifest[localRelative] = normRespUrl;
     } catch (err) {
-      // Handle opaque or destroyed response buffers gracefully
+      // Ignore destroyed response errors
     }
   });
 
@@ -155,9 +196,10 @@ function downloadDirect(urlStr) {
     try {
       await page.goto(normCurrentUrl, { waitUntil: 'networkidle0', timeout: 35000 });
 
-      // Trigger accordions and collapsible sections safely
+      // Trigger ONLY FAQ / content accordions (EXCLUDING mobile menu toggles and hamburger buttons)
       await page.evaluate(() => {
-        document.querySelectorAll('[aria-expanded="false"], .accordion-header, details:not([open]) summary').forEach(el => {
+        document.querySelectorAll('.faq-item summary, .elementor-accordion-title, details:not([open]) summary, .accordion-button.collapsed').forEach(el => {
+          if (el.closest('nav') || el.closest('.mobile-menu') || el.closest('.navbar') || el.closest('header')) return;
           try { el.click(); } catch(e) {}
         });
       });
@@ -179,6 +221,16 @@ function downloadDirect(urlStr) {
         });
       });
       await new Promise(r => setTimeout(r, 600));
+
+      // Force lazy-loaded images to populate real src & srcset attributes
+      await page.evaluate(() => {
+        document.querySelectorAll('img, source').forEach(img => {
+          const dSrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original');
+          const dSrcSet = img.getAttribute('data-srcset') || img.getAttribute('data-lazy-srcset');
+          if (dSrc) img.setAttribute('src', dSrc);
+          if (dSrcSet) img.setAttribute('srcset', dSrcSet);
+        });
+      });
 
       const rawHtml = await page.content();
       const tempHtmlPath = path.join(outputDir, fileName);
@@ -204,7 +256,7 @@ function downloadDirect(urlStr) {
 
   await browser.close();
 
-  // ---- POST-PROCESSING STEP 1: CSS Internal Resource Extraction ----
+  // ---- POST-PROCESSING STEP 1: CSS Sub-Resources ----
   console.log('\nProcessing CSS sub-resources (fonts, images inside CSS)...');
   const cssFiles = fs.readdirSync(assetsDir).filter(f => f.endsWith('.css'));
   for (const cssFile of cssFiles) {
@@ -219,7 +271,7 @@ function downloadDirect(urlStr) {
 
       while ((match = urlRegex.exec(cssText)) !== null) {
         const subUrlRaw = match[1];
-        if (subUrlRaw.startsWith('data:') || subUrlRaw.startsWith('#')) continue;
+        if (subUrlRaw.startsWith('data:') || subUrlRaw.startsWith('#') || subUrlRaw.startsWith('%23')) continue;
         try {
           const resolvedUrl = new URL(subUrlRaw, originalCssUrl).toString();
           subResourcesToFetch.push({ raw: subUrlRaw, resolved: resolvedUrl });
@@ -242,21 +294,46 @@ function downloadDirect(urlStr) {
         const localRelPath = downloaded.get(item.resolved);
         if (localRelPath) {
           const assetOnlyFilename = path.basename(localRelPath);
-          cssText = cssText.split(item.raw).join(assetOnlyFilename);
+          cssText = cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, q, innerUrl) => {
+            if (innerUrl.trim() === item.raw.trim()) {
+              return `url("${assetOnlyFilename}")`;
+            }
+            return m;
+          });
         }
       }
+
+      // Update relative asset paths in CSS file to point to assets/
+      cssText = cssText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (match, quote, urlStr) => {
+        const u = urlStr.trim();
+        if (
+          u.startsWith('/') ||
+          u.startsWith('data:') ||
+          u.startsWith('http:') ||
+          u.startsWith('https:') ||
+          u.startsWith('#') ||
+          u.startsWith('%23') ||
+          u.startsWith('blob:') ||
+          u.startsWith('assets/')
+        ) {
+          return match;
+        }
+        const cleanFile = u.replace(/^\.\//, '');
+        return `url("${cleanFile}")`;
+      });
+
       fs.writeFileSync(cssPath, cssText);
     }
   }
 
-  // ---- POST-PROCESSING STEP 2: Full HTML Link & Asset Rewriting ----
+  // ---- POST-PROCESSING STEP 2: HTML Link & Asset Rewriting ----
   console.log('\nPost-processing HTML files for 100% offline navigation and local assets...');
   const baseHost = getBaseHost(initialUrl);
 
   for (const pageInfo of savedPages) {
     let html = fs.readFileSync(pageInfo.rawHtmlPath, 'utf8');
 
-    // 1. Rewrite Page-to-Page Internal Links (<a href="...">)
+    // 1. Rewrite Page-to-Page Internal Links (<a href="...">) to local .html files
     for (const [pageUrl, targetHtmlFile] of pageToFilename.entries()) {
       html = html.split(`href="${pageUrl}"`).join(`href="${targetHtmlFile}"`);
       html = html.split(`href='${pageUrl}'`).join(`href='${targetHtmlFile}'`);
@@ -269,30 +346,78 @@ function downloadDirect(urlStr) {
             html = html.split(`href="${rootRel}"`).join(`href="${targetHtmlFile}"`);
             html = html.split(`href='${rootRel}'`).join(`href='${targetHtmlFile}'`);
           }
-        }
-      } catch (e) {}
-    }
-
-    // 2. Rewrite Asset URLs (CSS, JS, Images, Media)
-    for (const [originalAssetUrl, localAssetPath] of downloaded.entries()) {
-      html = html.split(originalAssetUrl).join(localAssetPath);
-
-      try {
-        const u = new URL(originalAssetUrl);
-        if (u.hostname === baseHost) {
-          const rootRel = u.pathname + u.search;
-          if (rootRel && rootRel !== '/') {
-            html = html.split(`"${rootRel}"`).join(`"${localAssetPath}"`);
-            html = html.split(`'${rootRel}'`).join(`'${localAssetPath}'`);
+          const pathOnly = u.pathname;
+          if (pathOnly && pathOnly !== '/') {
+            html = html.split(`href="${pathOnly}"`).join(`href="${targetHtmlFile}"`);
+            html = html.split(`href='${pathOnly}'`).join(`href='${targetHtmlFile}'`);
+            if (pathOnly.endsWith('/')) {
+              const noSlash = pathOnly.slice(0, -1);
+              html = html.split(`href="${noSlash}"`).join(`href="${targetHtmlFile}"`);
+              html = html.split(`href='${noSlash}'`).join(`href='${targetHtmlFile}'`);
+            }
           }
         }
       } catch (e) {}
     }
 
+    // 2. Rewrite Asset URLs (CSS, JS, Images, Fonts, Media)
+    for (const [originalAssetUrl, localAssetPath] of downloaded.entries()) {
+      html = html.split(originalAssetUrl).join(localAssetPath);
+      try {
+        const u = new URL(originalAssetUrl);
+        const rootRel = u.pathname + u.search;
+        if (rootRel && rootRel !== '/') {
+          html = html.split(`"${rootRel}"`).join(`"${localAssetPath}"`);
+          html = html.split(`'${rootRel}'`).join(`'${localAssetPath}'`);
+        }
+        const relNoSlash = u.pathname.replace(/^\//, '');
+        if (relNoSlash) {
+          html = html.split(`"${relNoSlash}"`).join(`"${localAssetPath}"`);
+          html = html.split(`'${relNoSlash}'`).join(`'${localAssetPath}'`);
+        }
+      } catch (e) {}
+    }
+
+    // Strip target site's old Next.js framework chunk scripts & __NEXT_DATA__ if scraping a Next.js site
+    html = html.replace(/<script\b[^>]*id="__NEXT_DATA__"[^>]*>[\s\S]*?<\/script>/gi, '');
+    html = html.replace(/<script\b[^>]*src="[^"]*\/_next\/static\/chunks\/[^"]*"[^>]*><\/script>/gi, '');
+    html = html.replace(/<script\b[^>]*src='[^']*\/_next\/static\/chunks\/[^']*'[^>]*><\/script>/gi, '');
+
+    // Rewrite srcset responsive image URLs
+    html = html.replace(/\bsrcset=(["'])([\s\S]*?)\1/gi, (match, quote, srcsetContent) => {
+      const parts = srcsetContent.split(',');
+      const newParts = parts.map(part => {
+        const trimmed = part.trim();
+        if (!trimmed) return part;
+        const spaceIdx = trimmed.search(/\s/);
+        const urlPart = spaceIdx !== -1 ? trimmed.slice(0, spaceIdx) : trimmed;
+        const descriptor = spaceIdx !== -1 ? trimmed.slice(spaceIdx) : '';
+
+        for (const [origUrl, localRel] of downloaded.entries()) {
+          if (urlPart === origUrl) return `${localRel}${descriptor}`;
+          try {
+            const u = new URL(origUrl);
+            if (urlPart === u.pathname + u.search || urlPart === u.pathname) return `${localRel}${descriptor}`;
+          } catch (e) {}
+        }
+        return part;
+      });
+      return `srcset=${quote}${newParts.join(', ')}${quote}`;
+    });
+
     fs.writeFileSync(pageInfo.rawHtmlPath, html);
-    console.log(`Rewritten offline links for: ${pageInfo.fileName}`);
   }
 
   fs.writeFileSync(path.join(outputDir, 'manifest.json'), JSON.stringify(manifest, null, 2));
-  console.log(`\n✅ Clone Complete! Total Pages: ${visited.size}, Total Assets: ${downloaded.size}`);
+
+  // ---- STEP 3: COMPRESS PURE HTML/CSS/JS SITE TO ZIP ----
+  console.log('\nCompressing Pure HTML, CSS & JS website into ZIP archive...');
+  const zipOutputPath = path.resolve('./scraped-site.zip');
+  await createZipArchive(outputDir, zipOutputPath);
+
+  console.log(`\n🎉 SUCCESS! Complete Website Scraped as Pure HTML, CSS & JS!`);
+  console.log(`- Scraped Directory: ${outputDir}`);
+  console.log(`- Downloadable ZIP: ${zipOutputPath}`);
+  console.log(`Total Pages: ${visited.size}, Total Assets: ${downloaded.size}`);
+  process.exit(0);
 })();
