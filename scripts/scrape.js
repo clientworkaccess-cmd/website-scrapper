@@ -8,7 +8,15 @@ const outputDir = './scraped-site';
 (async () => {
   const visited = new Set();
   const toVisit = [startUrl];
-  const browser = await puppeteer.launch();
+  const browser = await puppeteer.launch({
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu'
+    ]
+  });
   const page = await browser.newPage();
 
   if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
