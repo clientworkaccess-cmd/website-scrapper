@@ -8,6 +8,7 @@
     "scrape": "node scripts/scrape.js"
   },
   "dependencies": {
+    "archiver": "^6.0.1",
     "puppeteer": "^22.0.0"
   }
 }
